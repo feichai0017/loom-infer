@@ -20,7 +20,7 @@ cuda = [
 ]
 
 [dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "868f8ec4ef900bae7e67e7f9508b2da66eee5472", optional = true }
+cuda-core = { git = "https://github.com/feichai0017/cuda-oxide.git", rev = "e107c06d0aa389dd91351e7646ba924942c13b88", optional = true }
 half = { workspace = true, optional = true }
 oxide-infer = { path = "../oxide-infer" }
 oxide-infer-cuda = { path = "../oxide-infer-cuda" }

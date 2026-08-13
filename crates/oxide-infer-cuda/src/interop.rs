@@ -1,10 +1,9 @@
-//! Event-bridged execution over engine-owned CUDA streams and allocations.
+//! Checked execution over engine-owned CUDA streams and allocations.
 //!
 //! This is the only library module that calls the raw stream/event driver
-//! API. It never wraps an external `CUstream` in `CudaStream`, so Oxide never
-//! acquires or destroys the engine's stream. Commands still use the standard
-//! checked binding and provider enqueue path on a Oxide-owned non-blocking
-//! stream.
+//! API. It either bridges an Oxide-owned stream or uses cuda-oxide's explicit
+//! borrowed-stream wrapper. Oxide never acquires destruction ownership of the
+//! engine stream, and both modes use the standard checked command path.
 
 use crate::attention::{
     Bf16PagedBatchDecodeAlgorithm, Bf16PagedBatchDecodeArgs, Bf16PagedBatchDecodePlan,
@@ -134,8 +133,8 @@ pub enum ExternalCudaStreamError {
 /// stream returned by [`Self::submission_stream`].
 /// While Oxide owns the value during [`EngineInteropQueue::enqueue`], no other
 /// path may submit any work to that stream. This stream-wide exclusion ends
-/// only after Oxide enqueues the post-event wait or an error path settles both
-/// streams and returns the authority.
+/// only after Oxide establishes the selected stream handoff or an error path
+/// settles every participating stream and returns the authority.
 ///
 /// The bound regions must retain independent allocation and context leases.
 /// Dropping the authority immediately after a successful handoff must not free
@@ -150,6 +149,7 @@ pub unsafe trait StreamOrderedEngineAuthority {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineStreamHandoff {
     ExternalEventBridge,
+    ExternalStreamDirect,
 }
 
 /// Operator submitted through the engine interop queue.
@@ -484,13 +484,18 @@ const PAGED_BATCH_DECODE_BINDING_COUNT: usize = 9;
 
 struct EngineInteropShared {
     external: Arc<ExternalCudaStream>,
-    oxide_stream: Arc<CudaStream>,
+    command_stream: Arc<CudaStream>,
+    handoff: EngineStreamHandoff,
     free_slots: Mutex<Vec<EngineHandoffSlot>>,
     free_bindings: Mutex<Vec<CheckedBindings>>,
     poisoned: AtomicBool,
 }
 
 struct EngineHandoffSlot {
+    bridge: Option<EngineBridgeEvents>,
+}
+
+struct EngineBridgeEvents {
     pre_event: CudaEvent,
     post_event: CudaEvent,
     device_timing: Option<EngineDeviceTimingEvents>,
@@ -587,6 +592,7 @@ impl EngineCommand<'_> {
         &self,
         memory: BindingMemorySummary,
         bindings: &CheckedBindings,
+        handoff: EngineStreamHandoff,
     ) -> Option<EngineExecutionTrace> {
         let (plan, metadata_validation) = match self {
             Self::Bf16SingleDecode { plan, .. } => {
@@ -606,7 +612,7 @@ impl EngineCommand<'_> {
                     },
                     paged_kv_layout: None,
                     metadata_validation: None,
-                    handoff: EngineStreamHandoff::ExternalEventBridge,
+                    handoff,
                     adapter_device_to_device_copies: 0,
                     host_profile: None,
                     device_profile: None,
@@ -643,7 +649,7 @@ impl EngineCommand<'_> {
             },
             paged_kv_layout: Some(spec.kv_layout()),
             metadata_validation: Some(metadata_validation),
-            handoff: EngineStreamHandoff::ExternalEventBridge,
+            handoff,
             adapter_device_to_device_copies: 0,
             host_profile: None,
             device_profile: None,
@@ -689,7 +695,13 @@ impl EngineInteropQueue {
         max_commands: usize,
         max_in_flight: usize,
     ) -> Result<Self, EngineInteropBuildError> {
-        Self::new_impl(external, max_commands, max_in_flight, false)
+        Self::new_impl(
+            external,
+            max_commands,
+            max_in_flight,
+            EngineStreamHandoff::ExternalEventBridge,
+            false,
+        )
     }
 
     /// Creates an interop queue with diagnostic CUDA event timings enabled.
@@ -698,31 +710,68 @@ impl EngineInteropQueue {
         max_commands: usize,
         max_in_flight: usize,
     ) -> Result<Self, EngineInteropBuildError> {
-        Self::new_impl(external, max_commands, max_in_flight, true)
+        Self::new_impl(
+            external,
+            max_commands,
+            max_in_flight,
+            EngineStreamHandoff::ExternalEventBridge,
+            true,
+        )
+    }
+
+    /// Creates a queue that submits directly on the retained engine stream.
+    pub fn new_direct(
+        external: ExternalCudaStream,
+        max_commands: usize,
+        max_in_flight: usize,
+    ) -> Result<Self, EngineInteropBuildError> {
+        Self::new_impl(
+            external,
+            max_commands,
+            max_in_flight,
+            EngineStreamHandoff::ExternalStreamDirect,
+            false,
+        )
     }
 
     fn new_impl(
         external: ExternalCudaStream,
         max_commands: usize,
         max_in_flight: usize,
+        handoff: EngineStreamHandoff,
         device_profiling_enabled: bool,
     ) -> Result<Self, EngineInteropBuildError> {
-        let oxide_stream = external.context.new_stream()?;
-        let queue = CommandQueue::new(oxide_stream.clone(), max_commands, max_in_flight)?;
+        let command_stream = match handoff {
+            EngineStreamHandoff::ExternalEventBridge => external.context.new_stream()?,
+            EngineStreamHandoff::ExternalStreamDirect => {
+                // SAFETY: ExternalCudaStream validated `raw` and retains its
+                // engine lease in the shared queue and every completion.
+                unsafe {
+                    CudaStream::from_borrowed_raw_parts(external.raw, Arc::clone(&external.context))
+                }
+            }
+        };
+        let queue = CommandQueue::new(command_stream.clone(), max_commands, max_in_flight)?;
         let mut free_slots = Vec::with_capacity(max_in_flight);
         for _ in 0..max_in_flight {
             free_slots.push(EngineHandoffSlot {
-                pre_event: external.context.new_event(None)?,
-                post_event: external.context.new_event(None)?,
-                device_timing: device_profiling_enabled
-                    .then(|| EngineDeviceTimingEvents::new(&external.context))
-                    .transpose()?,
+                bridge: match handoff {
+                    EngineStreamHandoff::ExternalEventBridge => Some(EngineBridgeEvents {
+                        pre_event: external.context.new_event(None)?,
+                        post_event: external.context.new_event(None)?,
+                        device_timing: device_profiling_enabled
+                            .then(|| EngineDeviceTimingEvents::new(&external.context))
+                            .transpose()?,
+                    }),
+                    EngineStreamHandoff::ExternalStreamDirect => None,
+                },
             });
         }
         Ok(Self {
             shared: Arc::new(EngineInteropShared {
                 external: Arc::new(external),
-                oxide_stream,
+                command_stream,
+                handoff,
                 free_slots: Mutex::new(free_slots),
                 free_bindings: Mutex::new(Vec::with_capacity(max_in_flight)),
                 poisoned: AtomicBool::new(false),
@@ -751,18 +800,17 @@ impl EngineInteropQueue {
         self.queue.bindings(capacity)
     }
 
-    /// Enqueues one checked operator between two event handoffs.
+    /// Enqueues one checked operator through the queue's selected handoff.
     ///
-    /// The pre-event orders all prior engine work before Oxide. The post-event
-    /// orders future engine work after Oxide. The provider launches directly
-    /// against the bound device pointers and the adapter performs no copy.
+    /// A bridged queue orders an Oxide-owned stream with two events. A direct
+    /// queue submits on the retained engine stream without an event bridge.
+    /// Both modes launch against bound device pointers without adapter copies.
     ///
     /// `external_bindings` transfers the engine's stream and storage authority
-    /// for the handoff. On success, the post-event wait is already enqueued;
-    /// [`EngineSubmission::into_parts`] returns the stream-ordered authority
-    /// without waiting for the command. Failures before bridge work starts
+    /// for the handoff. [`EngineSubmission::into_parts`] returns the ordered
+    /// authority without waiting for the command. Failures before work starts
     /// return coupled authority and bindings immediately. Later failures settle
-    /// both streams before returning any authority.
+    /// every participating stream before returning any authority.
     pub fn enqueue<A: StreamOrderedEngineAuthority>(
         &mut self,
         command: EngineCommand<'_>,
@@ -799,7 +847,7 @@ impl EngineInteropQueue {
                 bindings,
             ));
         }
-        let Some(mut trace) = command.trace(memory, &bindings) else {
+        let Some(mut trace) = command.trace(memory, &bindings, self.shared.handoff) else {
             let cause = EngineEnqueueCause::BindingShape {
                 operator: command.operator(),
                 expected: command.binding_count(),
@@ -837,15 +885,32 @@ impl EngineInteropQueue {
                 ));
             }
         };
-        let oxide_stream = Arc::clone(&self.shared.oxide_stream);
+        let command_stream = Arc::clone(&self.shared.command_stream);
         let external_raw = self.shared.external.raw;
         let setup_host_nanoseconds = elapsed_nanoseconds(setup_started);
         let pre_handoff_started = self.host_profiling_enabled.then(Instant::now);
 
-        if let Some(timing) = &slot.device_timing {
+        if let Some(bridge) = &slot.bridge {
+            if let Some(timing) = &bridge.device_timing {
+                // SAFETY: ExternalCudaStream validated and retains `external_raw`.
+                let record_result =
+                    unsafe { record_event_on_raw_stream(&timing.external_start, external_raw) };
+                if let Err(error) = record_result {
+                    self.shared.poisoned.store(true, Ordering::Release);
+                    return Err(settle_started_failure(
+                        Arc::clone(&self.shared),
+                        slot,
+                        scope.finish(),
+                        EngineEnqueuePrimaryFailure::Bridge(error),
+                        authority,
+                    ));
+                }
+            }
+
             // SAFETY: ExternalCudaStream validated and retains `external_raw`.
+            // `pre_event` belongs to the same primary context.
             let record_result =
-                unsafe { record_event_on_raw_stream(&timing.external_start, external_raw) };
+                unsafe { record_event_on_raw_stream(&bridge.pre_event, external_raw) };
             if let Err(error) = record_result {
                 self.shared.poisoned.store(true, Ordering::Release);
                 return Err(settle_started_failure(
@@ -856,33 +921,23 @@ impl EngineInteropQueue {
                     authority,
                 ));
             }
-        }
-
-        // SAFETY: ExternalCudaStream validated and retains `external_raw`.
-        // `pre_event` belongs to the same primary context.
-        if let Err(error) = unsafe { record_event_on_raw_stream(&slot.pre_event, external_raw) } {
-            self.shared.poisoned.store(true, Ordering::Release);
-            return Err(settle_started_failure(
-                Arc::clone(&self.shared),
-                slot,
-                scope.finish(),
-                EngineEnqueuePrimaryFailure::Bridge(error),
-                authority,
-            ));
-        }
-        if let Err(error) = oxide_stream.wait(&slot.pre_event) {
-            self.shared.poisoned.store(true, Ordering::Release);
-            return Err(settle_started_failure(
-                Arc::clone(&self.shared),
-                slot,
-                scope.finish(),
-                EngineEnqueuePrimaryFailure::Bridge(error),
-                authority,
-            ));
+            if let Err(error) = command_stream.wait(&bridge.pre_event) {
+                self.shared.poisoned.store(true, Ordering::Release);
+                return Err(settle_started_failure(
+                    Arc::clone(&self.shared),
+                    slot,
+                    scope.finish(),
+                    EngineEnqueuePrimaryFailure::Bridge(error),
+                    authority,
+                ));
+            }
         }
         let pre_handoff_host_nanoseconds = elapsed_nanoseconds(pre_handoff_started);
-        if let Some(timing) = &slot.device_timing
-            && let Err(error) = timing.provider_start.record(&oxide_stream)
+        if let Some(timing) = slot
+            .bridge
+            .as_ref()
+            .and_then(|bridge| bridge.device_timing.as_ref())
+            && let Err(error) = timing.provider_start.record(&command_stream)
         {
             self.shared.poisoned.store(true, Ordering::Release);
             return Err(settle_started_failure(
@@ -911,8 +966,11 @@ impl EngineInteropQueue {
         let status_readback_started = self.host_profiling_enabled.then(Instant::now);
         scope.finalize_device_status();
         let status_readback_host_nanoseconds = elapsed_nanoseconds(status_readback_started);
-        if let Some(timing) = &slot.device_timing
-            && let Err(error) = timing.provider_end.record(&oxide_stream)
+        if let Some(timing) = slot
+            .bridge
+            .as_ref()
+            .and_then(|bridge| bridge.device_timing.as_ref())
+            && let Err(error) = timing.provider_end.record(&command_stream)
         {
             self.shared.poisoned.store(true, Ordering::Release);
             return Err(settle_started_failure(
@@ -924,34 +982,8 @@ impl EngineInteropQueue {
             ));
         }
         let post_handoff_started = self.host_profiling_enabled.then(Instant::now);
-        if let Err(error) = slot.post_event.record(&oxide_stream) {
-            self.shared.poisoned.store(true, Ordering::Release);
-            return Err(settle_started_failure(
-                Arc::clone(&self.shared),
-                slot,
-                scope.finish(),
-                EngineEnqueuePrimaryFailure::Bridge(error),
-                authority,
-            ));
-        }
-        // SAFETY: ExternalCudaStream retains the live raw stream and the event
-        // slot is retained by the returned completion. This enqueues only a
-        // wait and transfers no stream ownership.
-        if let Err(error) = unsafe { wait_raw_stream_on_event(external_raw, &slot.post_event) } {
-            self.shared.poisoned.store(true, Ordering::Release);
-            return Err(settle_started_failure(
-                Arc::clone(&self.shared),
-                slot,
-                scope.finish(),
-                EngineEnqueuePrimaryFailure::Bridge(error),
-                authority,
-            ));
-        }
-        if let Some(timing) = &slot.device_timing {
-            // SAFETY: ExternalCudaStream validated and retains `external_raw`.
-            let record_result =
-                unsafe { record_event_on_raw_stream(&timing.external_end, external_raw) };
-            if let Err(error) = record_result {
+        if let Some(bridge) = &slot.bridge {
+            if let Err(error) = bridge.post_event.record(&command_stream) {
                 self.shared.poisoned.store(true, Ordering::Release);
                 return Err(settle_started_failure(
                     Arc::clone(&self.shared),
@@ -960,6 +992,34 @@ impl EngineInteropQueue {
                     EngineEnqueuePrimaryFailure::Bridge(error),
                     authority,
                 ));
+            }
+            // SAFETY: ExternalCudaStream retains the live raw stream and the
+            // event slot stays retained through completion.
+            let wait_result = unsafe { wait_raw_stream_on_event(external_raw, &bridge.post_event) };
+            if let Err(error) = wait_result {
+                self.shared.poisoned.store(true, Ordering::Release);
+                return Err(settle_started_failure(
+                    Arc::clone(&self.shared),
+                    slot,
+                    scope.finish(),
+                    EngineEnqueuePrimaryFailure::Bridge(error),
+                    authority,
+                ));
+            }
+            if let Some(timing) = &bridge.device_timing {
+                // SAFETY: ExternalCudaStream validated and retains `external_raw`.
+                let record_result =
+                    unsafe { record_event_on_raw_stream(&timing.external_end, external_raw) };
+                if let Err(error) = record_result {
+                    self.shared.poisoned.store(true, Ordering::Release);
+                    return Err(settle_started_failure(
+                        Arc::clone(&self.shared),
+                        slot,
+                        scope.finish(),
+                        EngineEnqueuePrimaryFailure::Bridge(error),
+                        authority,
+                    ));
+                }
             }
         }
         let post_handoff_host_nanoseconds = elapsed_nanoseconds(post_handoff_started);
@@ -1037,7 +1097,7 @@ pub enum EngineEnqueueCause {
         live: usize,
         slots: usize,
     },
-    #[error("the engine interop queue is poisoned after an earlier bridge failure")]
+    #[error("the engine interop queue is poisoned after an earlier submission failure")]
     QueuePoisoned,
     #[error("engine interop in-flight capacity is exhausted")]
     InFlightCapacityExceeded,
@@ -1204,7 +1264,8 @@ impl EngineCommandCompletion {
                 match self
                     .slot
                     .as_ref()
-                    .and_then(|slot| slot.device_timing.as_ref())
+                    .and_then(|slot| slot.bridge.as_ref())
+                    .and_then(|bridge| bridge.device_timing.as_ref())
                     .map(EngineDeviceTimingEvents::profile)
                     .transpose()
                 {
@@ -1233,7 +1294,10 @@ impl EngineCommandCompletion {
             .slot
             .take()
             .expect("live engine completion has a handoff slot");
-        if let Some(timing) = &slot.device_timing
+        if let Some(timing) = slot
+            .bridge
+            .as_ref()
+            .and_then(|bridge| bridge.device_timing.as_ref())
             && timing.external_end.synchronize().is_err()
         {
             self.shared.poisoned.store(true, Ordering::Release);
@@ -1317,7 +1381,7 @@ fn settle_started_failure<A: StreamOrderedEngineAuthority>(
     authority: A,
 ) -> EngineEnqueueError<A> {
     let result = completion.wait();
-    settle_bridge_streams(&shared);
+    settle_interop_streams(&shared);
     lock_or_recover(&shared.free_slots).push(slot);
     match result {
         Ok(bindings) => EngineEnqueueError::recovered(
@@ -1353,17 +1417,19 @@ fn settle_started_failure<A: StreamOrderedEngineAuthority>(
     }
 }
 
-fn settle_bridge_streams(shared: &EngineInteropShared) {
-    let external_error = synchronize_external_stream_or_abort(&shared.external);
-    let oxide_error = synchronize_stream_or_abort(&shared.oxide_stream);
-    if external_error.is_some() || oxide_error.is_some() {
+fn settle_interop_streams(shared: &EngineInteropShared) {
+    let external_error = (shared.handoff == EngineStreamHandoff::ExternalEventBridge)
+        .then(|| synchronize_external_stream_or_abort(&shared.external))
+        .flatten();
+    let command_error = synchronize_stream_or_abort(&shared.command_stream);
+    if external_error.is_some() || command_error.is_some() {
         shared.poisoned.store(true, Ordering::Release);
     }
     if let Some(error) = external_error {
         shared.external.context.record_err::<()>(Err(error));
     }
-    if let Some(error) = oxide_error {
-        shared.oxide_stream.context().record_err::<()>(Err(error));
+    if let Some(error) = command_error {
+        shared.command_stream.context().record_err::<()>(Err(error));
     }
 }
 
@@ -1496,6 +1562,12 @@ mod tests {
         assert_eq!(trace.provider(), "oxide-infer-cuda");
         assert_eq!(trace.operator(), EngineOperator::Bf16SingleDecode);
         assert_eq!(trace.device_profile(), None);
+        let mut direct_trace = trace;
+        direct_trace.handoff = EngineStreamHandoff::ExternalStreamDirect;
+        assert_eq!(
+            direct_trace.stream_handoff(),
+            EngineStreamHandoff::ExternalStreamDirect
+        );
     }
 
     #[test]
